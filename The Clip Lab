@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The Clip Lab</title>
+<style>
+:root{--bg:#060807;--card:#141816;--text:#e8ede9;--muted:#8d968f;--accent:#22c55e;--border:#2a312c;--ok:#4ade80;--err:#ff7a7a;
+box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);color-scheme:dark}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:760px;margin:0 auto;padding:24px 16px 48px}
+h1{font-size:1.6rem;margin:0 0 4px}
+p.sub{color:var(--muted);margin:0 0 20px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px;margin-bottom:16px}
+label{display:block;font-weight:600;margin-bottom:8px}
+input[type=file]{width:100%}
+textarea{width:100%;min-height:150px;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);font:14px/1.5 ui-monospace,Menlo,Consolas,monospace;resize:vertical}
+.hint{color:var(--muted);font-size:.85rem;margin-top:6px}
+button{background:var(--accent);color:#04120a;border:0;border-radius:10px;padding:12px 20px;font-size:1rem;font-weight:600;cursor:pointer}
+button:disabled{opacity:.5;cursor:not-allowed}
+button.alt{background:transparent;color:var(--text);border:1px solid var(--border)}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+#preview{width:100%;max-height:300px;border-radius:10px;background:#000;margin-top:12px;display:none}
+#status{color:var(--muted);margin:8px 0}
+.bar{height:8px;background:var(--border);border-radius:99px;overflow:hidden;margin-top:6px}
+.bar>i{display:block;height:100%;width:0;background:var(--accent);transition:width .2s}
+.clip video{width:100%;border-radius:10px;background:#000;margin:8px 0}
+.clip a{color:#4ade80;font-weight:600}
+.clip .t{font-weight:600}
+.err{color:var(--err)}
+</style>
+</head>
+<body>
+<main>
+<h1>✂️ The <span style="color:var(--accent)">Clip</span> Lab</h1>
+<p class="sub">Cut clips from a video file on your device. Everything runs in your browser; nothing is uploaded.</p>
+
+<div class="card">
+<label for="file">1. Choose your video file</label>
+<input id="file" type="file" accept="video/*">
+<video id="preview" controls playsinline></video>
+</div>
+
+<div class="card">
+<label for="list">2. Paste your timestamps</label>
+<textarea id="list" placeholder="00:01:23 - 00:01:58 funny moment
+12:30 - 13:10 clutch play
+1:02:15 to 1:03:00 reaction"></textarea>
+<div class="hint">One clip per line: start and end, then an optional name. Separate with “-”, “to”, a comma or a space. Formats: <code>SS</code>, <code>MM:SS</code>, <code>HH:MM:SS</code>.</div>
+</div>
+
+<div class="row">
+<button id="go" disabled>Cut clips</button>
+<button id="stop" class="alt" disabled>Stop</button>
+</div>
+<div id="status"></div>
+<div class="bar"><i id="prog"></i></div>
+
+<div id="out" style="margin-top:20px"></div>
+<p class="hint">Note: clips are recorded in real time, so a 30-second clip takes about 30 seconds. Keep this tab open and in the foreground while it runs. The output is MP4 where your browser supports it (recent Chrome, Edge, Safari), otherwise WebM.</p>
+</main>
+
+<script>
+const $=id=>document.getElementById(id);
+const fileIn=$('file'),vid=$('preview'),list=$('list'),go=$('go'),stop=$('stop'),status=$('status'),prog=$('prog'),out=$('out');
+let url=null,cancel=false,audioCtx,dest,srcNode;
+
+fileIn.onchange=()=>{
+  const f=fileIn.files[0]; if(!f)return;
+  if(url)URL.revokeObjectURL(url);
+  url=URL.createObjectURL(f); vid.src=url; vid.style.display='block'; go.disabled=false;
+};
+
+function toSec(s){
+  const p=s.split(':').map(Number); let t=0;
+  for(const n of p)t=t*60+n; return t;
+}
+function fmt(s){
+  s=Math.round(s); const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;
+  return [h,m,x].map(n=>String(n).padStart(2,'0')).join('-');
+}
+function parse(text){
+  const re=/^\s*(\d+(?::\d+){0,2}(?:\.\d+)?)\s*(?:-|–|—|to|,|\s)\s*(\d+(?::\d+){0,2}(?:\.\d+)?)\s*(.*)$/i;
+  const clips=[],bad=[];
+  text.split(/\r?\n/).forEach((line,i)=>{
+    if(!line.trim())return;
+    const m=line.match(re);
+    if(!m){bad.push(i+1);return;}
+    const a=toSec(m[1]),b=toSec(m[2]);
+    if(b<=a){bad.push(i+1);return;}
+    clips.push({start:a,end:b,name:m[3].trim().replace(/[\\/:*?"<>|]/g,'')});
+  });
+  return {clips,bad};
+}
+
+function setup(){
+  if(audioCtx)return;
+  audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+  srcNode=audioCtx.createMediaElementSource(vid);
+  dest=audioCtx.createMediaStreamDestination();
+  srcNode.connect(dest); // not connected to speakers, so recording is silent
+}
+function pickType(){
+  const opts=['video/mp4;codecs=avc1,mp4a.40.2','video/mp4','video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm'];
+  return opts.find(t=>window.MediaRecorder&&MediaRecorder.isTypeSupported(t))||'';
+}
+function seek(t){
+  return new Promise(res=>{vid.onseeked=()=>{vid.onseeked=null;res();};vid.currentTime=t;});
+}
+
+async function record(c,onTick){
+  await seek(c.start);
+  const vs=vid.captureStream?vid.captureStream():vid.mozCaptureStream();
+  const tracks=[...vs.getVideoTracks(),...dest.stream.getAudioTracks()];
+  const type=pickType();
+  const rec=new MediaRecorder(new MediaStream(tracks),type?{mimeType:type}:undefined);
+  const chunks=[];
+  rec.ondataavailable=e=>e.data.size&&chunks.push(e.data);
+  const done=new Promise(r=>rec.onstop=r);
+  rec.start(500);
+  await vid.play();
+  await new Promise(res=>{
+    const iv=setInterval(()=>{
+      onTick((vid.currentTime-c.start)/(c.end-c.start));
+      if(cancel||vid.currentTime>=c.end||vid.ended){clearInterval(iv);res();}
+    },150);
+  });
+  vid.pause(); rec.stop(); await done;
+  return {blob:new Blob(chunks,{type:rec.mimeType}),mime:rec.mimeType};
+}
+
+go.onclick=async()=>{
+  const {clips,bad}=parse(list.value);
+  if(!clips.length){status.innerHTML='<span class="err">No valid timestamps found. Check the format.</span>';return;}
+  setup(); if(audioCtx.state==='suspended')await audioCtx.resume();
+  cancel=false; go.disabled=true; stop.disabled=false; out.innerHTML='';
+  const dur=vid.duration||Infinity;
+  let msg=bad.length?`Skipped invalid line(s): ${bad.join(', ')}. `:'';
+  for(let i=0;i<clips.length;i++){
+    const c=clips[i];
+    if(c.start>=dur){out.insertAdjacentHTML('beforeend',`<div class="card err">Clip ${i+1} starts after the end of the video. Skipped.</div>`);continue;}
+    c.end=Math.min(c.end,dur);
+    status.textContent=`${msg}Recording clip ${i+1} of ${clips.length}…`;
+    prog.style.width='0%';
+    try{
+      const r=await record(c,p=>{prog.style.width=Math.min(100,((i+p)/clips.length)*100)+'%';});
+      if(cancel)break;
+      const ext=r.mime.includes('mp4')?'mp4':'webm';
+      const name=`clip-${String(i+1).padStart(2,'0')}-${fmt(c.start)}${c.name?'-'+c.name:''}.${ext}`;
+      const u=URL.createObjectURL(r.blob);
+      out.insertAdjacentHTML('beforeend',`<div class="card clip"><div class="t">${i+1}. ${c.name||'Clip'} (${fmt(c.start).replace(/-/g,':')} → ${fmt(c.end).replace(/-/g,':')})</div><video src="${u}" controls playsinline></video><a href="${u}" download="${name}">⬇ Download ${ext.toUpperCase()}</a></div>`);
+    }catch(e){
+      out.insertAdjacentHTML('beforeend',`<div class="card err">Clip ${i+1} failed: ${e.message}</div>`);
+    }
+  }
+  prog.style.width=cancel?prog.style.width:'100%';
+  status.textContent=cancel?'Stopped.':'Done. Download your clips below.';
+  go.disabled=false; stop.disabled=true;
+};
+stop.onclick=()=>{cancel=true;};
+</script>
+</body>
+</html>
